@@ -33,6 +33,7 @@ func NewHandler(config Config) (*Handler, error) {
 	}
 
 	mux := httprouter.New()
+	mux.RedirectTrailingSlash = false
 
 	routedHandler.Handler = handler.Middleware(mux)
 
