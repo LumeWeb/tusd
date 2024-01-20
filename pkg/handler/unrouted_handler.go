@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"github.com/julienschmidt/httprouter"
 	"io"
 	"math"
 	"mime"
@@ -255,9 +256,9 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 
 // PostFile creates a new file upload using the datastore after validating the
 // length and parsing the metadata.
-func (handler *UnroutedHandler) PostFile(w http.ResponseWriter, r *http.Request) {
+func (handler *UnroutedHandler) PostFile(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 	if handler.isResumableUploadDraftRequest(r) {
-		handler.PostFileV2(w, r)
+		handler.PostFileV2(w, r, params)
 		return
 	}
 
@@ -428,7 +429,7 @@ func (handler *UnroutedHandler) PostFile(w http.ResponseWriter, r *http.Request)
 
 // PostFile creates a new file upload using the datastore after validating the
 // length and parsing the metadata.
-func (handler *UnroutedHandler) PostFileV2(w http.ResponseWriter, r *http.Request) {
+func (handler *UnroutedHandler) PostFileV2(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	c := handler.getContext(w, r)
 
 	// Parse headers
@@ -581,14 +582,10 @@ func (handler *UnroutedHandler) PostFileV2(w http.ResponseWriter, r *http.Reques
 }
 
 // HeadFile returns the length and offset for the HEAD request
-func (handler *UnroutedHandler) HeadFile(w http.ResponseWriter, r *http.Request) {
+func (handler *UnroutedHandler) HeadFile(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 	c := handler.getContext(w, r)
 
-	id, err := extractIDFromPath(r.URL.Path)
-	if err != nil {
-		handler.sendError(c, err)
-		return
-	}
+	id := params.ByName("id")
 	c.log = c.log.With("id", id)
 
 	if handler.composer.UsesLocker {
@@ -668,7 +665,7 @@ func (handler *UnroutedHandler) HeadFile(w http.ResponseWriter, r *http.Request)
 
 // PatchFile adds a chunk to an upload. This operation is only allowed
 // if enough space in the upload is left.
-func (handler *UnroutedHandler) PatchFile(w http.ResponseWriter, r *http.Request) {
+func (handler *UnroutedHandler) PatchFile(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 	c := handler.getContext(w, r)
 
 	isTusV1 := !handler.isResumableUploadDraftRequest(r)
@@ -686,11 +683,7 @@ func (handler *UnroutedHandler) PatchFile(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	id, err := extractIDFromPath(r.URL.Path)
-	if err != nil {
-		handler.sendError(c, err)
-		return
-	}
+	id := params.ByName("id")
 	c.log = c.log.With("id", id)
 
 	if handler.composer.UsesLocker {
@@ -946,14 +939,10 @@ func (handler *UnroutedHandler) finishUploadIfComplete(c *httpContext, resp HTTP
 
 // GetFile handles requests to download a file using a GET request. This is not
 // part of the specification.
-func (handler *UnroutedHandler) GetFile(w http.ResponseWriter, r *http.Request) {
+func (handler *UnroutedHandler) GetFile(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 	c := handler.getContext(w, r)
 
-	id, err := extractIDFromPath(r.URL.Path)
-	if err != nil {
-		handler.sendError(c, err)
-		return
-	}
+	id := params.ByName("id")
 	c.log = c.log.With("id", id)
 
 	if handler.composer.UsesLocker {
@@ -1070,7 +1059,7 @@ func filterContentType(info FileInfo) (contentType string, contentDisposition st
 }
 
 // DelFile terminates an upload permanently.
-func (handler *UnroutedHandler) DelFile(w http.ResponseWriter, r *http.Request) {
+func (handler *UnroutedHandler) DelFile(w http.ResponseWriter, r *http.Request, params httprouter.Params) {
 	c := handler.getContext(w, r)
 
 	// Abort the request handling if the required interface is not implemented
@@ -1079,11 +1068,7 @@ func (handler *UnroutedHandler) DelFile(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	id, err := extractIDFromPath(r.URL.Path)
-	if err != nil {
-		handler.sendError(c, err)
-		return
-	}
+	id := params.ByName("id")
 	c.log = c.log.With("id", id)
 
 	if handler.composer.UsesLocker {

@@ -1,9 +1,8 @@
 package handler
 
 import (
+	"github.com/julienschmidt/httprouter"
 	"net/http"
-
-	"github.com/bmizerany/pat"
 )
 
 // Handler is a ready to use handler with routing (using pat)
@@ -33,20 +32,20 @@ func NewHandler(config Config) (*Handler, error) {
 		UnroutedHandler: handler,
 	}
 
-	mux := pat.New()
+	mux := httprouter.New()
 
 	routedHandler.Handler = handler.Middleware(mux)
 
-	mux.Post("", http.HandlerFunc(handler.PostFile))
-	mux.Head(":id", http.HandlerFunc(handler.HeadFile))
-	mux.Add("PATCH", ":id", http.HandlerFunc(handler.PatchFile))
+	mux.POST("/", handler.PostFile)
+	mux.HEAD("/:id", handler.HeadFile)
+	mux.PATCH("/:id", handler.PatchFile)
 	if !config.DisableDownload {
-		mux.Get(":id", http.HandlerFunc(handler.GetFile))
+		mux.GET("/:id", handler.GetFile)
 	}
 
 	// Only attach the DELETE handler if the Terminate() method is provided
 	if config.StoreComposer.UsesTerminater && !config.DisableTermination {
-		mux.Del(":id", http.HandlerFunc(handler.DelFile))
+		mux.DELETE("/:id", handler.DelFile)
 	}
 
 	return routedHandler, nil
