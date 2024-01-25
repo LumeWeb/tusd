@@ -722,11 +722,19 @@ func (upload s3Upload) fetchInfo(ctx context.Context) (info handler.FileInfo, pa
 func (upload s3Upload) GetReader(ctx context.Context) (io.ReadCloser, error) {
 	store := upload.store
 
-	// Attempt to get upload content
-	res, err := store.Service.GetObject(ctx, &s3.GetObjectInput{
+	rangeData := ctx.Value("range")
+
+	input := &s3.GetObjectInput{
 		Bucket: aws.String(store.Bucket),
 		Key:    store.keyWithPrefix(upload.objectId),
-	})
+	}
+
+	if rangeData != nil {
+		input.Range = aws.String(rangeData.(string))
+	}
+
+	// Attempt to get upload content
+	res, err := store.Service.GetObject(ctx, input)
 	if err == nil {
 		// No error occurred, and we are able to stream the object
 		return res.Body, nil
