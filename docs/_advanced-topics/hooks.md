@@ -142,6 +142,13 @@ Below you can find an annotated, JSON-ish encoded example of a hook response:
         // Body is the response body.
         "Body": "{\"message\":\"the upload is too big\"}",
         // Header contains additional HTTP headers for the response. The values are strings.
+        // The uploading client can retrieve these header, allowing the server to send
+        // information back to the client. Note that if you are using custom headers and want
+        // them to be accessible by JavaScript running inside a browser, you likely have to
+        // configure Cross-Origin Resource Sharing (CORS) to include your custom header in
+        // Access-Control-Expose-Headers or otherwise browsers will block access to the custom
+        // header. See https://tus.github.io/tusd/getting-started/configuration/#cross-origin-resource-sharing-cors
+        // for more details about tusd and CORS.  
         "Header": {
             "Content-Type": "application/json"
         },
@@ -168,6 +175,15 @@ Below you can find an annotated, JSON-ish encoded example of a hook response:
         // path component according to RFC 3986 (https://datatracker.ietf.org/doc/html/rfc3986#section-3.3).
         // These are: A-Z a-z 0-9 - . _ ~ % ! $ ' ( ) * + , ; = / : @
         // In addition, IDs must not begin or end with a forward slash (/).
+        //
+        // When a custom upload ID is specified, it is the hook's responsibility to
+        // ensure that the upload ID will not cause collisions with resources from other
+        // uploads. Tusd does not check for collisions. Collisions happen frequently when
+        // the upload ID is mainly derived from the filename, which can be prevented by including
+        // a random part (e.g. a UUID) in the upload ID. In addition, be aware that some storage
+        // backends, such as the S3 store, save additional objects using `.info` and `.part`
+        // extensions. If you set a custom upload ID, ensure that this ID will also not collide
+        // with these additional objects.
         "ID": "my-custom-upload-id",
         // Set custom meta data that is saved with the upload and also accessible to
         // all future hooks. Note that this information is also visible to the client
