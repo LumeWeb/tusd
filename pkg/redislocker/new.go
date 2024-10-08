@@ -23,6 +23,10 @@ func New(uri string, lockerOptions ...LockerOption) (*RedisLocker, error) {
 		return nil, err
 	}
 	client := redis.NewClient(connection)
+	return NewWithClient(client, lockerOptions...)
+}
+
+func NewWithClient(client *redis.Client, lockerOptions ...LockerOption) (*RedisLocker, error) {
 	if res := client.Ping(context.Background()); res.Err() != nil {
 		return nil, res.Err()
 	}
