@@ -5,7 +5,7 @@ import (
 	"github.com/go-redsync/redsync/v4"
 	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	"github.com/redis/go-redis/v9"
-	"golang.org/x/exp/slog"
+	"log/slog"
 	"os"
 )
 
