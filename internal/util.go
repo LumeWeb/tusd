@@ -107,8 +107,18 @@ func (c *TracedContext) Cleanup() {
 func NewCancelContext(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
 
-	return ctx, func() {
-		fmt.Printf("Cancel called for context from:\n%s\n", string(debug.Stack()))
-		cancel()
+	wrappedCancel := func() {
+		// Only print stack trace if we're not already cancelled
+		select {
+		case <-ctx.Done():
+			// Context is already cancelled, just propagate the cancellation
+			cancel()
+		default:
+			// This is a new cancellation, print the stack trace
+			fmt.Printf("Cancel called for context from:\n%s\n", string(debug.Stack()))
+			cancel()
+		}
 	}
+
+	return ctx, wrappedCancel
 }
