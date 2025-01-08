@@ -166,16 +166,20 @@ func (handler *UnroutedHandler) SupportedExtensions() string {
 // this middleware.
 func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Create the primary request context with tracing. This helps us track client disconnects
-		// and overall request lifecycle events.
+		// Create the primary request context with tracing to track client disconnects
+		// and overall request lifecycle events
 		requestCtx := internal.TraceContext(r.Context(), fmt.Sprintf("request-%s-%s", r.Method, r.URL.Path))
 
-		// Create our handler context and make it available in the request.
-		// The handler context carries our internal state and configuration.
-		c := handler.newContext(w, r.WithContext(requestCtx))
+		// Create our handler context with cancellation tracking. This lets us see exactly
+		// where server-side cancellations originate
+		handlerBaseCtx, handlerCancel := internal.NewCancelContext(requestCtx)
+		defer handlerCancel()
 
-		// Create a multi-traced context that monitors both the request and handler contexts.
-		// This allows us to differentiate between client-side cancellations and server-side issues.
+		// Create handler context with our internal state and configuration
+		c := handler.newContext(w, r.WithContext(handlerBaseCtx))
+
+		// Create a multi-traced context that monitors both request and handler contexts
+		// This helps differentiate between client-side and server-side cancellations
 		handlerCtx := internal.TraceMultiContext(
 			c,
 			fmt.Sprintf("handler-%s-%s", r.Method, r.URL.Path),
@@ -183,8 +187,7 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 		)
 		r = r.WithContext(handlerCtx)
 
-		// Ensure we clean up our traced contexts when the request completes.
-		// This prevents goroutine leaks from our tracing implementation.
+		// Clean up traced contexts when the request completes to prevent goroutine leaks
 		defer func() {
 			if tc, ok := handlerCtx.(*internal.TracedContext); ok {
 				tc.Cleanup()
@@ -194,18 +197,19 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 			}
 		}()
 
-		// Create a separate context for network timeout operations.
-		// This helps us track timeout-related cancellations specifically.
-		timeoutCtx := internal.TraceContext(handlerCtx, fmt.Sprintf("network-timeout-%s-%s", r.Method, r.URL.Path))
+		// Network timeout context with cancellation tracking
+		timeoutCtx, timeoutCancel := internal.NewCancelContext(handlerCtx)
+		defer timeoutCancel()
 
-		// Calculate our deadline times up front for consistency
+		// Calculate deadline times up front for consistency
 		readDeadline := time.Now().Add(handler.config.NetworkTimeout)
 		writeDeadline := time.Now().Add(2 * handler.config.NetworkTimeout)
 
-		// Set up our network timeouts with context awareness
+		// Set up network timeouts with context awareness
 		select {
 		case <-timeoutCtx.Done():
 			c.log.Warn("TimeoutContextCancelled", "error", timeoutCtx.Err())
+			timeoutCancel() // This cancellation will be traced
 			return
 		default:
 			if err := c.resC.SetReadDeadline(readDeadline); err != nil {
@@ -227,13 +231,15 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 
 		header := w.Header()
 
-		// Create a traced context for CORS operations
-		corsCtx := internal.TraceContext(handlerCtx, fmt.Sprintf("cors-%s-%s", r.Method, r.URL.Path))
+		// CORS context with cancellation tracking
+		corsCtx, corsCancel := internal.NewCancelContext(handlerCtx)
+		defer corsCancel()
 
 		// Handle CORS with context awareness
 		select {
 		case <-corsCtx.Done():
 			c.log.Warn("CorsContextCancelled", "error", corsCtx.Err())
+			corsCancel() // This cancellation will be traced
 			return
 		default:
 			cors := handler.config.Cors
@@ -270,13 +276,15 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 		// Security headers
 		header.Set("X-Content-Type-Options", "nosniff")
 
-		// Handle OPTIONS requests with context awareness
+		// Handle OPTIONS requests with cancellation tracking
 		if r.Method == "OPTIONS" {
-			optionsCtx := internal.TraceContext(handlerCtx, fmt.Sprintf("options-%s", r.URL.Path))
+			optionsCtx, optionsCancel := internal.NewCancelContext(handlerCtx)
+			defer optionsCancel()
 
 			select {
 			case <-optionsCtx.Done():
 				c.log.Warn("OptionsContextCancelled", "error", optionsCtx.Err())
+				optionsCancel() // This cancellation will be traced
 				return
 			default:
 				if handler.config.MaxSize > 0 {
@@ -299,8 +307,9 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 			return
 		}
 
-		// Create the final handler context with tracing
-		finalCtx := internal.TraceContext(handlerCtx, fmt.Sprintf("final-handler-%s-%s", r.Method, r.URL.Path))
+		// Final handler context with cancellation tracking
+		finalCtx, finalCancel := internal.NewCancelContext(handlerCtx)
+		defer finalCancel()
 		r = r.WithContext(finalCtx)
 
 		// Pass the request to the next handler in the chain

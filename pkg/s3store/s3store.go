@@ -477,13 +477,15 @@ func (upload *s3Upload) uploadParts(ctx context.Context, offset int64, src io.Re
 
 	partProducer, fileChan := newS3PartProducer(src, store.MaxBufferedParts, store.TemporaryDirectory, store.diskWriteDurationMetric)
 
-	producerCtx, cancelProducer := context.WithCancel(ctx)
+	// Create a cancellable context for the producer with tracking
+	// This will help us identify where producer cancellations originate
+	producerCtx, producerCancel := internal.NewCancelContext(ctx)
 	defer func() {
-		cancelProducer()
+		producerCancel() // This cancellation will be traced
 		partProducer.closeUnreadFiles()
 	}()
 
-	// Create traced context for producer
+	// Create traced context for producer to monitor its lifecycle
 	producerCtx = internal.TraceContext(producerCtx, fmt.Sprintf("part-producer-%s", upload.objectId))
 
 	go partProducer.produce(producerCtx, optimalPartSize)
@@ -512,11 +514,17 @@ func (upload *s3Upload) uploadParts(ctx context.Context, offset int64, src io.Re
 			}
 			upload.parts = append(upload.parts, part)
 
-			// Create traced context for each upload part
-			partCtx := upload.createUploadContext(ctx, part.number)
+			// Create cancellable context for each upload part with tracking
+			// This helps identify where individual part upload cancellations occur
+			partBaseCtx, partCancel := internal.NewCancelContext(ctx)
+			partCtx := upload.createUploadContext(partBaseCtx, part.number)
 
 			eg.Go(func() error {
-				defer upload.store.releaseUploadSemaphore()
+				// Ensure we clean up the part context when done
+				defer func() {
+					partCancel() // This cancellation will be traced
+					upload.store.releaseUploadSemaphore()
+				}()
 
 				t := time.Now()
 				uploadPartInput := &s3.UploadPartInput{
@@ -541,11 +549,15 @@ func (upload *s3Upload) uploadParts(ctx context.Context, offset int64, src io.Re
 				return nil
 			})
 		} else {
-			// Create traced context for incomplete part upload
-			incompleteCtx := internal.TraceContext(ctx, fmt.Sprintf("incomplete-part-%s", upload.objectId))
+			// Create cancellable context for incomplete part upload with tracking
+			incompleteBaseCtx, incompleteCancel := internal.NewCancelContext(ctx)
+			incompleteCtx := internal.TraceContext(incompleteBaseCtx, fmt.Sprintf("incomplete-part-%s", upload.objectId))
 
 			eg.Go(func() error {
-				defer upload.store.releaseUploadSemaphore()
+				defer func() {
+					incompleteCancel() // This cancellation will be traced
+					upload.store.releaseUploadSemaphore()
+				}()
 
 				err := store.putIncompletePartForUpload(incompleteCtx, upload.objectId, partfile)
 				if err == nil {
@@ -581,16 +593,24 @@ func cleanUpTempFile(file *os.File) {
 }
 
 func (upload *s3Upload) putPartForUpload(ctx context.Context, uploadPartInput *s3.UploadPartInput, file io.ReadSeeker, size int64) (string, error) {
+	// Create a base traced context to monitor the overall put operation
 	ctx = internal.TraceContext(ctx, fmt.Sprintf("put-part-%d-%s", *uploadPartInput.PartNumber, upload.objectId))
 
 	if !upload.store.DisableContentHashes {
+		// Direct S3 upload path
+		// Create cancellable context for the S3 upload operation
+		uploadCtx, uploadCancel := internal.NewCancelContext(ctx)
+		defer uploadCancel() // This will help us track where the upload was cancelled
+
+		// Use our cancellable context for the upload
 		uploadPartInput.Body = file
-		res, err := upload.store.Service.UploadPart(ctx, uploadPartInput)
+		res, err := upload.store.Service.UploadPart(uploadCtx, uploadPartInput)
 		if err != nil {
 			return "", err
 		}
 		return *res.ETag, nil
 	} else {
+		// Presigned URL path
 		s3Client, ok := upload.store.Service.(*s3.Client)
 		if !ok {
 			return "", fmt.Errorf("s3store: failed to cast S3 service for presigning")
@@ -598,7 +618,11 @@ func (upload *s3Upload) putPartForUpload(ctx context.Context, uploadPartInput *s
 
 		presignClient := s3.NewPresignClient(s3Client)
 
-		s3Req, err := presignClient.PresignUploadPart(ctx, uploadPartInput, func(opts *s3.PresignOptions) {
+		// Create cancellable context for the presigning operation
+		presignCtx, presignCancel := internal.NewCancelContext(ctx)
+		defer presignCancel() // This will help us track presigning cancellations
+
+		s3Req, err := presignClient.PresignUploadPart(presignCtx, uploadPartInput, func(opts *s3.PresignOptions) {
 			opts.Expires = 15 * time.Minute
 		})
 		if err != nil {
@@ -612,8 +636,12 @@ func (upload *s3Upload) putPartForUpload(ctx context.Context, uploadPartInput *s
 
 		req.ContentLength = size
 
-		// Use context with the HTTP request
-		req = req.WithContext(ctx)
+		// Create cancellable context for the HTTP request
+		httpCtx, httpCancel := internal.NewCancelContext(ctx)
+		defer httpCancel() // This will help us track HTTP request cancellations
+
+		// Use our cancellable context with the HTTP request
+		req = req.WithContext(httpCtx)
 
 		res, err := http.DefaultClient.Do(req)
 		if err != nil {

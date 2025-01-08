@@ -11,11 +11,31 @@ import (
 func TraceContext(ctx context.Context, name string) context.Context {
 	traceDone := make(chan struct{})
 
+	// Capture the stack trace when the context is created
+	creationStack := string(debug.Stack())
+	creationTime := time.Now()
+
 	go func() {
 		select {
 		case <-ctx.Done():
-			fmt.Printf("Context %s cancelled due to: %v\nStack trace:\n%s\n",
-				name, ctx.Err(), string(debug.Stack()))
+			cancelTime := time.Now()
+			fmt.Printf(`
+Context %s cancelled:
+Created at: %s
+Cancelled at: %s
+Time alive: %s
+Creation stack:
+%s
+Cancellation stack:
+%s
+Error: %v
+`, name,
+				creationTime.Format(time.RFC3339Nano),
+				cancelTime.Format(time.RFC3339Nano),
+				cancelTime.Sub(creationTime),
+				creationStack,
+				string(debug.Stack()),
+				ctx.Err())
 		case <-traceDone:
 			// Context is being cleaned up normally
 		}
@@ -26,7 +46,8 @@ func TraceContext(ctx context.Context, name string) context.Context {
 		cleanup: func() {
 			close(traceDone)
 		},
-		name: name,
+		name:      name,
+		createdAt: creationTime,
 	}
 }
 
@@ -61,6 +82,7 @@ type TracedContext struct {
 	once        sync.Once
 	cleanupOnce sync.Once
 	name        string
+	createdAt   time.Time
 }
 
 func (c *TracedContext) Done() <-chan struct{} {
@@ -81,4 +103,12 @@ func (c *TracedContext) Value(key interface{}) interface{} {
 
 func (c *TracedContext) Cleanup() {
 	c.cleanupOnce.Do(c.cleanup)
+}
+func NewCancelContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+
+	return ctx, func() {
+		fmt.Printf("Cancel called for context from:\n%s\n", string(debug.Stack()))
+		cancel()
+	}
 }
