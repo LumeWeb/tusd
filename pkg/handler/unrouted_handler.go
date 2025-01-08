@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/tus/tusd/v2/internal"
 	"io"
 	"math"
 	"mime"
@@ -165,105 +166,144 @@ func (handler *UnroutedHandler) SupportedExtensions() string {
 // this middleware.
 func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Construct our own context and make it available in the request. Successive logic
-		// should use handler.getContext to retrieve it
-		c := handler.newContext(w, r)
-		r = r.WithContext(c)
+		// Create the primary request context with tracing. This helps us track client disconnects
+		// and overall request lifecycle events.
+		requestCtx := internal.TraceContext(r.Context(), fmt.Sprintf("request-%s-%s", r.Method, r.URL.Path))
 
-		// Set the initial read deadline for consuming the request body. All headers have already been read,
-		// so this is only for reading the request body. While reading, we regularly update the read deadline
-		// so this deadline is usually not final. See the bodyReader and writeChunk.
-		// We also update the write deadline, but makes sure that it is larger than the read deadline, so we
-		// can still write a response in the case of a read timeout.
-		if err := c.resC.SetReadDeadline(time.Now().Add(handler.config.NetworkTimeout)); err != nil {
-			c.log.Warn("NetworkControlError", "error", err)
-		}
-		if err := c.resC.SetWriteDeadline(time.Now().Add(2 * handler.config.NetworkTimeout)); err != nil {
-			c.log.Warn("NetworkControlError", "error", err)
+		// Create our handler context and make it available in the request.
+		// The handler context carries our internal state and configuration.
+		c := handler.newContext(w, r.WithContext(requestCtx))
+
+		// Create a multi-traced context that monitors both the request and handler contexts.
+		// This allows us to differentiate between client-side cancellations and server-side issues.
+		handlerCtx := internal.TraceMultiContext(
+			c,
+			fmt.Sprintf("handler-%s-%s", r.Method, r.URL.Path),
+			requestCtx,
+		)
+		r = r.WithContext(handlerCtx)
+
+		// Ensure we clean up our traced contexts when the request completes.
+		// This prevents goroutine leaks from our tracing implementation.
+		defer func() {
+			if tc, ok := handlerCtx.(*internal.TracedContext); ok {
+				tc.Cleanup()
+			}
+			if tc, ok := requestCtx.(*internal.TracedContext); ok {
+				tc.Cleanup()
+			}
+		}()
+
+		// Create a separate context for network timeout operations.
+		// This helps us track timeout-related cancellations specifically.
+		timeoutCtx := internal.TraceContext(handlerCtx, fmt.Sprintf("network-timeout-%s-%s", r.Method, r.URL.Path))
+
+		// Calculate our deadline times up front for consistency
+		readDeadline := time.Now().Add(handler.config.NetworkTimeout)
+		writeDeadline := time.Now().Add(2 * handler.config.NetworkTimeout)
+
+		// Set up our network timeouts with context awareness
+		select {
+		case <-timeoutCtx.Done():
+			c.log.Warn("TimeoutContextCancelled", "error", timeoutCtx.Err())
+			return
+		default:
+			if err := c.resC.SetReadDeadline(readDeadline); err != nil {
+				c.log.Warn("NetworkControlError", "operation", "read", "error", err)
+			}
+			if err := c.resC.SetWriteDeadline(writeDeadline); err != nil {
+				c.log.Warn("NetworkControlError", "operation", "write", "error", err)
+			}
 		}
 
-		// Allow overriding the HTTP method. The reason for this is
-		// that some libraries/environments do not support PATCH and
-		// DELETE requests, e.g. Flash in a browser and parts of Java.
+		// Handle HTTP method override for clients with limited HTTP method support
 		if newMethod := r.Header.Get("X-HTTP-Method-Override"); r.Method == "POST" && newMethod != "" {
 			r.Method = newMethod
+			c.log.Info("MethodOverride", "new_method", newMethod)
 		}
 
 		c.log.Info("RequestIncoming")
-
 		handler.Metrics.incRequestsTotal(r.Method)
 
 		header := w.Header()
 
-		cors := handler.config.Cors
-		if origin := r.Header.Get("Origin"); !cors.Disable && origin != "" {
-			originIsAllowed := cors.AllowOrigin.MatchString(origin)
-			if !originIsAllowed {
-				handler.sendError(c, ErrOriginNotAllowed)
-				return
-			}
+		// Create a traced context for CORS operations
+		corsCtx := internal.TraceContext(handlerCtx, fmt.Sprintf("cors-%s-%s", r.Method, r.URL.Path))
 
-			header.Set("Access-Control-Allow-Origin", origin)
-			header.Set("Vary", "Origin")
+		// Handle CORS with context awareness
+		select {
+		case <-corsCtx.Done():
+			c.log.Warn("CorsContextCancelled", "error", corsCtx.Err())
+			return
+		default:
+			cors := handler.config.Cors
+			if origin := r.Header.Get("Origin"); !cors.Disable && origin != "" {
+				originIsAllowed := cors.AllowOrigin.MatchString(origin)
+				if !originIsAllowed {
+					handler.sendError(c, ErrOriginNotAllowed)
+					return
+				}
 
-			if cors.AllowCredentials {
-				header.Add("Access-Control-Allow-Credentials", "true")
-			}
+				header.Set("Access-Control-Allow-Origin", origin)
+				header.Set("Vary", "Origin")
 
-			if r.Method == "OPTIONS" {
-				// Preflight request
-				header.Add("Access-Control-Allow-Methods", cors.AllowMethods)
-				header.Add("Access-Control-Allow-Headers", cors.AllowHeaders)
-				header.Set("Access-Control-Max-Age", cors.MaxAge)
-			} else {
-				// Actual request
-				header.Add("Access-Control-Expose-Headers", cors.ExposeHeaders)
+				if cors.AllowCredentials {
+					header.Add("Access-Control-Allow-Credentials", "true")
+				}
+
+				if r.Method == "OPTIONS" {
+					header.Add("Access-Control-Allow-Methods", cors.AllowMethods)
+					header.Add("Access-Control-Allow-Headers", cors.AllowHeaders)
+					header.Set("Access-Control-Max-Age", cors.MaxAge)
+				} else {
+					header.Add("Access-Control-Expose-Headers", cors.ExposeHeaders)
+				}
 			}
 		}
 
-		// Detect requests with tus v1 protocol vs the IETF resumable upload draft
+		// Protocol version detection
 		isTusV1 := !handler.usesIETFDraft(r)
-
 		if isTusV1 {
-			// Set current version used by the server
 			header.Set("Tus-Resumable", "1.0.0")
 		}
 
-		// Add nosniff to all responses https://golang.org/src/net/http/server.go#L1429
+		// Security headers
 		header.Set("X-Content-Type-Options", "nosniff")
 
-		// Set appropriated headers in case of OPTIONS method allowing protocol
-		// discovery and end with an 204 No Content
+		// Handle OPTIONS requests with context awareness
 		if r.Method == "OPTIONS" {
-			if handler.config.MaxSize > 0 {
-				header.Set("Tus-Max-Size", strconv.FormatInt(handler.config.MaxSize, 10))
+			optionsCtx := internal.TraceContext(handlerCtx, fmt.Sprintf("options-%s", r.URL.Path))
+
+			select {
+			case <-optionsCtx.Done():
+				c.log.Warn("OptionsContextCancelled", "error", optionsCtx.Err())
+				return
+			default:
+				if handler.config.MaxSize > 0 {
+					header.Set("Tus-Max-Size", strconv.FormatInt(handler.config.MaxSize, 10))
+				}
+
+				header.Set("Tus-Version", "1.0.0")
+				header.Set("Tus-Extension", handler.extensions)
+
+				handler.sendResp(c, HTTPResponse{
+					StatusCode: http.StatusOK,
+				})
+				return
 			}
-
-			header.Set("Tus-Version", "1.0.0")
-			header.Set("Tus-Extension", handler.extensions)
-
-			// Although the 204 No Content status code is a better fit in this case,
-			// since we do not have a response body included, we cannot use it here
-			// as some browsers only accept 200 OK as successful response to a
-			// preflight request. If we send them the 204 No Content the response
-			// will be ignored or interpreted as a rejection.
-			// For example, the Presto engine, which is used in older versions of
-			// Opera, Opera Mobile and Opera Mini, handles CORS this way.
-			handler.sendResp(c, HTTPResponse{
-				StatusCode: http.StatusOK,
-			})
-			return
 		}
 
-		// Test if the version sent by the client is supported
-		// GET and HEAD methods are not checked since a browser may visit this URL and does
-		// not include this header. GET requests are not part of the specification.
+		// Version compatibility check
 		if r.Method != "GET" && r.Method != "HEAD" && r.Header.Get("Tus-Resumable") != "1.0.0" && isTusV1 {
 			handler.sendError(c, ErrUnsupportedVersion)
 			return
 		}
 
-		// Proceed with routing the request
+		// Create the final handler context with tracing
+		finalCtx := internal.TraceContext(handlerCtx, fmt.Sprintf("final-handler-%s-%s", r.Method, r.URL.Path))
+		r = r.WithContext(finalCtx)
+
+		// Pass the request to the next handler in the chain
 		h.ServeHTTP(w, r)
 	})
 }

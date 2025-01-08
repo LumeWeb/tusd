@@ -75,6 +75,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tus/tusd/v2/internal"
 	"io"
 	"net/http"
 	"os"
@@ -442,6 +443,19 @@ func (upload *s3Upload) WriteChunk(ctx context.Context, offset int64, src io.Rea
 	return bytesUploaded, err
 }
 
+func (upload *s3Upload) createUploadContext(ctx context.Context, partNum int32) context.Context {
+	return internal.TraceContext(ctx, fmt.Sprintf("upload-part-%d-%s", partNum, upload.objectId))
+}
+
+// Monitor both the producer and consumer contexts
+func (upload *s3Upload) createProducerConsumerContext(producerCtx context.Context, consumerCtx context.Context) context.Context {
+	return internal.TraceMultiContext(
+		producerCtx,
+		fmt.Sprintf("producer-consumer-%s", upload.objectId),
+		consumerCtx,
+	)
+}
+
 func (upload *s3Upload) uploadParts(ctx context.Context, offset int64, src io.Reader) (int64, error) {
 	store := upload.store
 
@@ -468,15 +482,16 @@ func (upload *s3Upload) uploadParts(ctx context.Context, offset int64, src io.Re
 		cancelProducer()
 		partProducer.closeUnreadFiles()
 	}()
+
+	// Create traced context for producer
+	producerCtx = internal.TraceContext(producerCtx, fmt.Sprintf("part-producer-%s", upload.objectId))
+
 	go partProducer.produce(producerCtx, optimalPartSize)
 
 	var eg errgroup.Group
 
 	for {
-		// We acquire the semaphore before starting the goroutine to avoid
-		// starting many goroutines, most of which are just waiting for the lock.
-		// We also acquire the semaphore before reading from the channel to reduce
-		// the number of part files are laying around on disk without being used.
+		// We acquire the semaphore before starting the goroutine
 		upload.store.acquireUploadSemaphore()
 		fileChunk, more := <-fileChan
 		if !more {
@@ -497,6 +512,9 @@ func (upload *s3Upload) uploadParts(ctx context.Context, offset int64, src io.Re
 			}
 			upload.parts = append(upload.parts, part)
 
+			// Create traced context for each upload part
+			partCtx := upload.createUploadContext(ctx, part.number)
+
 			eg.Go(func() error {
 				defer upload.store.releaseUploadSemaphore()
 
@@ -507,7 +525,7 @@ func (upload *s3Upload) uploadParts(ctx context.Context, offset int64, src io.Re
 					UploadId:   aws.String(upload.multipartId),
 					PartNumber: aws.Int32(part.number),
 				}
-				etag, err := upload.putPartForUpload(ctx, uploadPartInput, partfile, part.size)
+				etag, err := upload.putPartForUpload(partCtx, uploadPartInput, partfile, part.size)
 				store.observeRequestDuration(t, metricUploadPart)
 				if err == nil {
 					part.etag = etag
@@ -523,10 +541,13 @@ func (upload *s3Upload) uploadParts(ctx context.Context, offset int64, src io.Re
 				return nil
 			})
 		} else {
+			// Create traced context for incomplete part upload
+			incompleteCtx := internal.TraceContext(ctx, fmt.Sprintf("incomplete-part-%s", upload.objectId))
+
 			eg.Go(func() error {
 				defer upload.store.releaseUploadSemaphore()
 
-				err := store.putIncompletePartForUpload(ctx, upload.objectId, partfile)
+				err := store.putIncompletePartForUpload(incompleteCtx, upload.objectId, partfile)
 				if err == nil {
 					upload.incompletePartSize = partsize
 				}
@@ -560,8 +581,9 @@ func cleanUpTempFile(file *os.File) {
 }
 
 func (upload *s3Upload) putPartForUpload(ctx context.Context, uploadPartInput *s3.UploadPartInput, file io.ReadSeeker, size int64) (string, error) {
+	ctx = internal.TraceContext(ctx, fmt.Sprintf("put-part-%d-%s", *uploadPartInput.PartNumber, upload.objectId))
+
 	if !upload.store.DisableContentHashes {
-		// By default, use the traditional approach to upload data
 		uploadPartInput.Body = file
 		res, err := upload.store.Service.UploadPart(ctx, uploadPartInput)
 		if err != nil {
@@ -569,10 +591,6 @@ func (upload *s3Upload) putPartForUpload(ctx context.Context, uploadPartInput *s
 		}
 		return *res.ETag, nil
 	} else {
-		// Experimental feature to prevent the AWS SDK from calculating the SHA256 hash
-		// for the parts we upload to S3.
-		// We compute the presigned URL without the body attached and then send the request
-		// on our own. This way, the body is not included in the SHA256 calculation.
 		s3Client, ok := upload.store.Service.(*s3.Client)
 		if !ok {
 			return "", fmt.Errorf("s3store: failed to cast S3 service for presigning")
@@ -592,9 +610,10 @@ func (upload *s3Upload) putPartForUpload(ctx context.Context, uploadPartInput *s
 			return "", err
 		}
 
-		// Set the Content-Length manually to prevent the usage of Transfer-Encoding: chunked,
-		// which is not supported by AWS S3.
 		req.ContentLength = size
+
+		// Use context with the HTTP request
+		req = req.WithContext(ctx)
 
 		res, err := http.DefaultClient.Do(req)
 		if err != nil {
